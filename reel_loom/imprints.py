@@ -1,7 +1,7 @@
 import hashlib
 import json
 import zipfile
-from .errors import require, missing
+from .errors import require, missing, LoomError
 from .values import identifier, now, canonical, digest, object_body
 
 
@@ -70,20 +70,44 @@ class Imprints:
 
     def verify(self, imprint_id):
         imprint = self.get(imprint_id)
+        # The blob digest is the content address: this fails for replaced,
+        # truncated or otherwise tampered package bytes before the archive is
+        # opened. No prior verification verdict can short-circuit the check.
         path = self.blobs.resolve(imprint["blob"], verify=True)
+        verified = self.check_package(imprint, path)
+        receipt = {"fingerprint": imprint["fingerprint"],
+                   "bytes": path.stat().st_size, "verified_files": verified,
+                   "blob": imprint["blob"]}
+        with self.db.write_unit() as db:
+            previous = db.execute("SELECT payload FROM events WHERE subject=? AND kind='imprint_verified' ORDER BY sequence DESC LIMIT 1",
+                                  (imprint_id,)).fetchone()
+            if not previous or json.loads(previous["payload"]) != receipt:
+                self.db.event(db, imprint_id, "imprint_verified", receipt)
+        return {"id": imprint_id, "valid": True, "verified_files": verified,
+                "fingerprint": imprint["fingerprint"], "blob": imprint["blob"]}
+
+    def check_package(self, imprint, path):
+        """Validate one frozen imprint against its on-disk package.
+
+        Read-only by contract: storage anomalies are reported as errors, never
+        used to rewrite the frozen manifest or the imprint's blob pointer.
+        Returns the list of verified package member names.
+        """
         manifest = imprint["manifest"]
-        with self.db.read() as db:
-            row = db.execute("SELECT payload FROM events WHERE subject=? AND kind='imprint_verified' ORDER BY sequence DESC LIMIT 1",
-                             (imprint_id,)).fetchone()
-        if row:
-            receipt = json.loads(row["payload"])
-            if (receipt.get("fingerprint") == imprint["fingerprint"]
-                    and receipt.get("bytes") == path.stat().st_size):
-                return {"id": imprint_id, "valid": True,
-                        "verified_files": receipt["verified_files"],
-                        "fingerprint": imprint["fingerprint"], "blob": imprint["blob"]}
-        with zipfile.ZipFile(path) as archive:
-            require(json.loads(archive.read("manifest.json")) == manifest,
+        if digest(manifest) != imprint["fingerprint"]:
+            raise LoomError("imprint_record_tampered",
+                            "Frozen imprint manifest no longer matches its delivery fingerprint", 409)
+        try:
+            archive = zipfile.ZipFile(path)
+        except (OSError, zipfile.BadZipFile) as exc:
+            raise LoomError("package_unreadable", "Delivery package cannot be read", 409) from exc
+        with archive:
+            try:
+                packaged = json.loads(archive.read("manifest.json"))
+            except (KeyError, ValueError) as exc:
+                raise LoomError("manifest_mismatch",
+                                "Packaged manifest differs from frozen record", 409) from exc
+            require(packaged == manifest,
                     "manifest_mismatch", "Packaged manifest differs from frozen record", 409)
             expected_names = {"manifest.json"} | {item["name"] for item in manifest["files"]}
             if manifest["caption"]:
@@ -101,13 +125,4 @@ class Imprints:
                 require(hasher.hexdigest() == item["blob"] and size == item["size"],
                         "rendition_mismatch", "Packaged media differs from frozen content", 409)
                 verified.append(item["name"])
-        receipt = {"fingerprint": imprint["fingerprint"],
-                   "bytes": path.stat().st_size, "verified_files": verified,
-                   "blob": imprint["blob"]}
-        with self.db.write_unit() as db:
-            previous = db.execute("SELECT payload FROM events WHERE subject=? AND kind='imprint_verified' ORDER BY sequence DESC LIMIT 1",
-                                  (imprint_id,)).fetchone()
-            if not previous or json.loads(previous["payload"]) != receipt:
-                self.db.event(db, imprint_id, "imprint_verified", receipt)
-        return {"id": imprint_id, "valid": True, "verified_files": verified,
-                "fingerprint": imprint["fingerprint"], "blob": imprint["blob"]}
+        return verified

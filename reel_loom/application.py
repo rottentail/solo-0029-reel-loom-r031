@@ -43,7 +43,7 @@ class Application:
             self.analysis = AudioAnalysis(self.db, self.assets, self.blobs, self.processes)
             self.frames = Frames(self.assets, self.blobs, self.processes, self.artifacts)
             self.imprints = Imprints(self.db, self.blobs, self.tickets, self.captions)
-            self.resources = Resources(self.db, self.blobs)
+            self.resources = Resources(self.db, self.blobs, self.imprints)
             self.recovery = self.tickets.recover()
             self.renderer = Renderer(settings, self.blobs, self.tickets, self.planner, self.processes, self.artifacts)
             if start_workers:

@@ -1,6 +1,5 @@
 from contextlib import contextmanager
 import hashlib
-import json
 import os
 from pathlib import Path
 import tempfile
@@ -55,36 +54,15 @@ class BlobStore:
         if not path.is_file():
             raise missing("blob", key)
         if verify:
-            receipt_dir = self.root.parent / "receipts"
-            receipt_dir.mkdir(exist_ok=True)
-            receipt_path = receipt_dir / (key + ".json")
-            receipt = None
-            if receipt_path.is_file():
-                try:
-                    receipt = json.loads(receipt_path.read_text())
-                except (OSError, ValueError):
-                    receipt = None
-            stat = path.stat()
-            if isinstance(receipt, dict):
-                if receipt.get("digest") == key and receipt.get("size") == stat.st_size:
-                    return path
+            # A content-addressed store is only trustworthy while the bytes
+            # hash to the address. Caching a past verdict (even one that also
+            # records the size) lets an equal-length replacement masquerade as
+            # the original media, so every verified read re-hashes the bytes.
             hasher = hashlib.sha256()
             with path.open("rb") as source:
                 for chunk in iter(lambda: source.read(1024*1024), b""):
                     hasher.update(chunk)
             require(hasher.hexdigest() == key, "blob_corrupt", "Media digest differs from stored content", 409)
-            receipt = {"digest": key, "size": stat.st_size,
-                       "verified": now(), "format": 1}
-            fd, temporary = tempfile.mkstemp(prefix=".receipt-", dir=receipt_dir)
-            try:
-                with os.fdopen(fd, "w") as target:
-                    json.dump(receipt, target, sort_keys=True)
-                    target.flush()
-                    os.fsync(target.fileno())
-                os.replace(temporary, receipt_path)
-            finally:
-                if os.path.exists(temporary):
-                    os.unlink(temporary)
         return path
 
     def get(self, key):

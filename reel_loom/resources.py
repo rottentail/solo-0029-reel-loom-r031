@@ -1,12 +1,10 @@
-import json
-import zipfile
-from .values import now
-from .values import canonical
+import hashlib
+from .errors import LoomError
 
 
 class Resources:
-    def __init__(self, db, blobs):
-        self.db, self.blobs = db, blobs
+    def __init__(self, db, blobs, imprints):
+        self.db, self.blobs, self.imprints = db, blobs, imprints
 
     def sweep(self, dry_run=True):
         with self.db.write_unit() as db:
@@ -25,17 +23,31 @@ class Resources:
                     "candidate_bytes": sum(row["size"] for row in candidates), "removed": removed}
 
     def reconcile(self):
-        refreshed = self._refresh_packages()
+        # Reconciliation is strictly read-only: a storage anomaly can never be
+        # promoted into a new delivery fact. Frozen imprint records are never
+        # rewritten; every registered blob is re-hashed and every imprint
+        # package is validated against its own frozen manifest.
         with self.db.read() as db:
             rows = db.execute("SELECT hash,size FROM blobs ORDER BY hash").fetchall()
-            missing, bad_size = [], []
-            for row in rows:
-                path = self.blobs.path(row["hash"])
-                if not path.is_file():
-                    missing.append(row["hash"])
-                elif path.stat().st_size != row["size"]:
-                    bad_size.append(row["hash"])
-            known = {row["hash"] for row in rows}
+            imprints = [self.imprints.get(row["id"], db)
+                        for row in db.execute("SELECT id FROM imprints ORDER BY created,id").fetchall()]
+        missing, bad_size, bad_digest = [], [], []
+        for row in rows:
+            key = row["hash"]
+            path = self.blobs.path(key)
+            if not path.is_file():
+                missing.append(key)
+                continue
+            if path.stat().st_size != row["size"]:
+                bad_size.append(key)
+                continue
+            hasher = hashlib.sha256()
+            with path.open("rb") as source:
+                for chunk in iter(lambda: source.read(1024 * 1024), b""):
+                    hasher.update(chunk)
+            if hasher.hexdigest() != key:
+                bad_digest.append(key)
+        known = {row["hash"] for row in rows}
         orphaned = []
         for folder in self.blobs.root.iterdir():
             if not folder.is_dir() or len(folder.name) != 2:
@@ -44,39 +56,28 @@ class Resources:
                 key = folder.name + path.name
                 if path.is_file() and len(key) == 64 and key not in known:
                     orphaned.append({"hash": key, "bytes": path.stat().st_size})
-        return {"consistent": not missing and not bad_size, "missing": missing,
-                "bad_size": bad_size, "unregistered_blobs": orphaned,
-                "refreshed_packages": refreshed}
+        damaged_blobs = set(missing) | set(bad_size) | set(bad_digest)
+        imprint_issues = []
+        for imprint in imprints:
+            issue = self._check_imprint(imprint, damaged_blobs)
+            if issue is not None:
+                imprint_issues.append(issue)
+        return {"consistent": not (missing or bad_size or bad_digest or imprint_issues),
+                "missing": missing,
+                "bad_size": bad_size,
+                "bad_digest": bad_digest,
+                "unregistered_blobs": orphaned,
+                "imprint_issues": imprint_issues}
 
-    def _refresh_packages(self):
-        with self.db.read() as db:
-            rows = db.execute("SELECT id,blob,manifest FROM imprints ORDER BY created,id").fetchall()
-        refreshed = []
-        for row in rows:
-            path = self.blobs.path(row["blob"])
-            if not path.is_file():
-                continue
-            try:
-                with zipfile.ZipFile(path) as archive:
-                    manifest = json.loads(archive.read("manifest.json"))
-                    files = manifest.get("files")
-                    if not isinstance(files, list) or not files:
-                        continue
-                    if any(item.get("name") not in archive.namelist() for item in files):
-                        continue
-            except (OSError, ValueError, KeyError, zipfile.BadZipFile):
-                continue
-            document = canonical(manifest)
-            if document == row["manifest"]:
-                continue
-            with self.db.write_unit() as db:
-                blob = self.blobs.put(path, db)
-                db.execute("UPDATE imprints SET manifest=? WHERE id=?", (document, row["id"]))
-                self.db.event(db, row["id"], "imprint_catalog_refreshed",
-                              {"previous_blob": row["blob"], "observed_blob": blob["hash"]})
-            with self.db.write_unit() as db:
-                db.execute("UPDATE imprints SET blob=? WHERE id=?", (blob["hash"], row["id"]))
-                self.db.event(db, row["id"], "imprint_content_refreshed",
-                              {"blob": blob["hash"]})
-            refreshed.append({"id": row["id"], "blob": blob["hash"]})
-        return refreshed
+    def _check_imprint(self, imprint, damaged_blobs):
+        entry = {"id": imprint["id"], "blob": imprint["blob"]}
+        if imprint["blob"] in damaged_blobs:
+            entry["reason"] = "package_digest_mismatch"
+            return entry
+        path = self.blobs.path(imprint["blob"])
+        try:
+            self.imprints.check_package(imprint, path)
+        except LoomError as exc:
+            entry["reason"] = exc.code
+            return entry
+        return None
